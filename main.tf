@@ -18,7 +18,7 @@ resource "google_compute_network" "autoscale_network" {
 }
 
 resource "google_compute_subnetwork" "autoscale_subnet" {
-  name = "autoscale-submit"
+  name = "autoscale-subnet"
   ip_cidr_range = "10.0.1.0/24"
   region = var.region
   network = google_compute_network.autoscale_network.id
@@ -197,7 +197,7 @@ resource "google_compute_backend_service" "web_backend" {
 }
 
 resource "google_compute_url_map" "web_url_map" {
-  name = "wweb-url-map"
+  name = "web-url-map"
   default_service = google_compute_backend_service.web_backend.id
 }
 
