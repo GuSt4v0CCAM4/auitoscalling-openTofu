@@ -71,7 +71,6 @@ resource "google_compute_instance_template" "web_template" {
     enable-oslogin = "TRUE"
   }
 
-  # Script CORREGIDO - usando \$ para variables shell
   metadata_startup_script = <<-EOF
   #!/bin/bash
   apt-get update -y
