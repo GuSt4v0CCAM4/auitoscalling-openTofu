@@ -38,12 +38,18 @@ resource "google_compute_firewall" "web" {
 
 #Chequeo del health
 resource "google_compute_health_check" "autohealing" {
-  name = "autohealing-health-check"
+  name               = "autohealing-health-check"
+  check_interval_sec = 5
+  timeout_sec        = 5
+  healthy_threshold  = 2
+  unhealthy_threshold = 3
 
-  http2_health_check {
-    port = 80
+  http_health_check {
+    port         = 80
+    request_path = "/"
   }
 }
+
 
 #Instancias template
 resource "google_compute_instance_template" "web_template" {
@@ -89,7 +95,7 @@ resource "google_compute_instance_template" "web_template" {
     </style>
   </head>
   <body>
-    <h1>🔄 Autoscaling Demo - GCP</h1>
+    <h1>Autoscaling Demo - GCP</h1>
     <div class="info">
       <h2>Instance: $(hostname)</h2>
       <p><strong>Zone:</strong> $(curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/zone | awk -F/ '{print $4}')</p>
@@ -98,7 +104,7 @@ resource "google_compute_instance_template" "web_template" {
       <p><strong>Uptime:</strong> <span id="uptime">0s</span></p>
     </div>
     <hr>
-    <h3>📊 Métricas de Autoscaling</h3>
+    <h3>Metricas de Autoscaling</h3>
     <p>Esta demo genera carga automática cada 3 minutos</p>
     <p>Las instancias se escalan cuando CPU > 60%</p>
   </body>
@@ -108,11 +114,9 @@ resource "google_compute_instance_template" "web_template" {
   # Script de carga periódica
   cat <<'EOLB' > /usr/local/bin/auto-load.sh
   #!/bin/bash
-  while true; do
-    echo "$(date): Generando carga de CPU por 90 segundos..."
-    stress-ng --cpu 2 --timeout 90
-    sleep 180  # Esperar 3 minutos entre cargas
-  done
+  echo "$(date): Generando carga de CPU por 60 segundos..."
+  stress-ng --cpu 2 --timeout 60
+  echo "$(date): Carga completada. Script finalizado."
   EOLB
   chmod +x /usr/local/bin/auto-load.sh
 
@@ -155,6 +159,11 @@ resource "google_compute_autoscaler" "web_autoscaler" {
     cpu_utilization {
       target = 0.6 #&0% del CPU,  cunado se supere este se autoescalara
     }
+
+    # Agregar escala basada en carga
+       load_balancing_utilization {
+         target = 0.6
+       }
   }
 }
 
@@ -176,25 +185,34 @@ resource "google_compute_instance_group_manager" "web_group" {
 
   target_size = 2
 
-  #auto_healing_policies {
-  #  health_check = google_compute_health_check.autohealing.id
-  #  initial_delay_sec = 300
-  #}
+  auto_healing_policies {
+    health_check = google_compute_health_check.autohealing.id
+    initial_delay_sec = 300
+  }
 }
 
 #Load Balancer
 resource "google_compute_backend_service" "web_backend" {
-  name = "web-backend-service"
-  port_name = "http"
-  protocol = "HTTP"
-  timeout_sec = 10
+  name        = "web-backend-service"
+  port_name   = "http"
+  protocol    = "HTTP"
+  timeout_sec = 30
 
   backend {
-    group = google_compute_instance_group_manager.web_group.instance_group
+    group           = google_compute_instance_group_manager.web_group.instance_group
+    balancing_mode  = "UTILIZATION"
+    capacity_scaler = 1.0
+    max_utilization = 0.8
   }
 
   health_checks = [google_compute_health_check.autohealing.id]
+
+  log_config {
+    enable      = true
+    sample_rate = 1.0
+  }
 }
+
 
 resource "google_compute_url_map" "web_url_map" {
   name = "web-url-map"
