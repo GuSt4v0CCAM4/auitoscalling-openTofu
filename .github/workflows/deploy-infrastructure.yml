@@ -1,0 +1,277 @@
+name: Deploy Infrastructure with OpenTofu
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - '**.tf'
+      - 'terraform.tfvars'
+      - '.github/workflows/deploy-infrastructure.yml'
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        default: 'apply'
+        type: choice
+        options:
+          - apply
+          - plan
+          - destroy
+
+env:
+  TF_VERSION: '1.6.6'
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  REGION: ${{ secrets.GCP_REGION || 'us-central1' }}
+
+jobs:
+  validate:
+    name: Validate Terraform Configuration
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup OpenTofu
+        uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Format Check
+        run: tofu fmt -check -recursive
+        continue-on-error: true
+
+      - name: Terraform Init
+        run: tofu init
+
+      - name: Terraform Validate
+        run: tofu validate
+
+  plan:
+    name: Plan Infrastructure Changes
+    needs: validate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+
+      - name: Setup gcloud CLI
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Setup OpenTofu
+        uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: tofu init
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          tofu plan \
+            -var="project_id=${{ env.PROJECT_ID }}" \
+            -var="region=${{ env.REGION }}" \
+            -var="enable_auto_deploy=false" \
+            -out=tfplan \
+            -no-color
+        continue-on-error: true
+
+      - name: Comment PR with Plan
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const output = `#### Terraform Plan 📖
+
+            **Project ID:** \`${{ env.PROJECT_ID }}\`
+            **Region:** \`${{ env.REGION }}\`
+
+            <details><summary>Show Plan</summary>
+
+            \`\`\`terraform
+            ${{ steps.plan.outputs.stdout }}
+            \`\`\`
+
+            </details>
+
+            *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+
+  apply:
+    name: Apply Infrastructure
+    needs: plan
+    if: |
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') &&
+      (github.event_name == 'push' || github.event.inputs.action == 'apply')
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+
+      - name: Setup gcloud CLI
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Enable required GCP APIs
+        run: |
+          gcloud services enable compute.googleapis.com
+          gcloud services enable storage.googleapis.com
+          gcloud services enable containerregistry.googleapis.com
+
+      - name: Setup OpenTofu
+        uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: tofu init
+
+      - name: Terraform Apply
+        run: |
+          tofu apply \
+            -var="project_id=${{ env.PROJECT_ID }}" \
+            -var="region=${{ env.REGION }}" \
+            -var="enable_auto_deploy=false" \
+            -auto-approve
+
+      - name: Get Infrastructure Outputs
+        id: outputs
+        run: |
+          echo "k3s_server_ip=$(tofu output -raw k3s_server_ip)" >> $GITHUB_OUTPUT
+          echo "load_balancer_ip=$(tofu output -raw load_balancer_ip)" >> $GITHUB_OUTPUT
+          echo "bucket_name=$(tofu output -raw k8s_manifests_bucket)" >> $GITHUB_OUTPUT
+
+      - name: Wait for K3s initialization
+        run: |
+          echo "⏳ Waiting 180 seconds for K3s server to initialize..."
+          sleep 180
+
+      - name: Verify K3s cluster
+        run: |
+          gcloud compute ssh k3s-master-server \
+            --zone=${{ env.REGION }}-a \
+            --command="sudo kubectl get nodes" || echo "K3s not ready yet"
+
+      - name: Display Access Information
+        run: |
+          echo "=========================================="
+          echo "✅ Infrastructure Deployed Successfully!"
+          echo "=========================================="
+          echo ""
+          echo "🖥️  K3s Server IP: ${{ steps.outputs.outputs.k3s_server_ip }}"
+          echo "🌐 Load Balancer IP: ${{ steps.outputs.outputs.load_balancer_ip }}"
+          echo "📦 Manifests Bucket: ${{ steps.outputs.outputs.bucket_name }}"
+          echo ""
+          echo "🔧 Next steps:"
+          echo "1. Run the deploy-coarlumini.sh script to deploy the application"
+          echo "2. Access SSH: gcloud compute ssh k3s-master-server --zone=${{ env.REGION }}-a"
+          echo ""
+          echo "=========================================="
+
+      - name: Create deployment summary
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY <<EOF
+          # 🚀 Infrastructure Deployment Complete
+
+          ## 📊 Deployment Information
+
+          - **Project ID**: \`${{ env.PROJECT_ID }}\`
+          - **Region**: \`${{ env.REGION }}\`
+          - **K3s Server IP**: \`${{ steps.outputs.outputs.k3s_server_ip }}\`
+          - **Load Balancer IP**: \`${{ steps.outputs.outputs.load_balancer_ip }}\`
+          - **Manifests Bucket**: \`${{ steps.outputs.outputs.bucket_name }}\`
+
+          ## 🔧 Next Steps
+
+          1. Deploy Coarlumini application:
+             \`\`\`bash
+             ./deploy-coarlumini.sh
+             \`\`\`
+
+          2. Access the K3s master:
+             \`\`\`bash
+             gcloud compute ssh k3s-master-server --zone=${{ env.REGION }}-a
+             \`\`\`
+
+          3. Verify cluster:
+             \`\`\`bash
+             kubectl get nodes
+             kubectl get pods -A
+             \`\`\`
+
+          ## 🌐 Access URLs
+
+          - **Frontend**: http://${{ steps.outputs.outputs.load_balancer_ip }}
+          - **Direct Access**: http://${{ steps.outputs.outputs.k3s_server_ip }}:30080
+
+          EOF
+
+  destroy:
+    name: Destroy Infrastructure
+    if: github.event.inputs.action == 'destroy'
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+
+      - name: Setup gcloud CLI
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Setup OpenTofu
+        uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: tofu init
+
+      - name: Terraform Destroy
+        run: |
+          tofu destroy \
+            -var="project_id=${{ env.PROJECT_ID }}" \
+            -var="region=${{ env.REGION }}" \
+            -auto-approve
+
+      - name: Confirm Destruction
+        run: |
+          echo "=========================================="
+          echo "🗑️  Infrastructure Destroyed"
+          echo "=========================================="
+          echo ""
+          echo "All resources have been removed from GCP"
+          echo ""
