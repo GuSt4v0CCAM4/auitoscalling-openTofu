@@ -82,15 +82,24 @@ docker --version || error "Docker no se instaló correctamente"
 log "✓ Docker instalado correctamente"
 
 # ============================================
-# CONFIGURAR DOCKER PARA GCR
+# CONFIGURAR CONTAINERD PARA GCR
 # ============================================
 
-log "Configurando Docker para Google Container Registry..."
+log "Configurando containerd para Google Container Registry..."
 
-# Configurar Docker credential helper para GCR
+# Configurar gcloud auth para GCR
 gcloud auth configure-docker gcr.io --quiet
 
-# Crear configuración adicional de Docker
+# Crear configuración para crictl (cliente de containerd)
+mkdir -p /etc
+cat > /etc/crictl.yaml <<EOF
+runtime-endpoint: unix:///run/k3s/containerd/containerd.sock
+image-endpoint: unix:///run/k3s/containerd/containerd.sock
+timeout: 10
+debug: false
+EOF
+
+# Configurar Docker también por compatibilidad
 mkdir -p /etc/docker
 cat > /etc/docker/daemon.json <<EOF
 {
@@ -106,7 +115,7 @@ EOF
 # Reiniciar Docker para aplicar cambios
 systemctl restart docker
 
-log "✓ Docker configurado para GCR"
+log "✓ Containerd y Docker configurados para GCR"
 
 # ============================================
 # ESPERAR A QUE EL SERVIDOR K3S ESTÉ DISPONIBLE
@@ -172,16 +181,16 @@ IMAGES=(
     "gcr.io/${PROJECT_ID}/coarlumini-frontend:latest"
 )
 
-# Descargar cada imagen
+# Descargar cada imagen usando crictl (K3s usa containerd)
 for image in "${IMAGES[@]}"; do
-    log "Descargando $image..."
+    log "Descargando $image con crictl..."
 
     # Intentar descargar hasta 3 veces
     max_retries=3
     retry=0
 
     while [ $retry -lt $max_retries ]; do
-        if docker pull "$image" 2>&1 | tee /tmp/docker-pull.log; then
+        if crictl pull "$image" 2>&1 | tee /tmp/crictl-pull.log; then
             log "✓ Imagen descargada: $image"
             break
         else
@@ -198,8 +207,8 @@ for image in "${IMAGES[@]}"; do
 done
 
 # Verificar imágenes descargadas
-log "Imágenes Docker locales:"
-docker images | grep coarlumini || log "⚠ No se encontraron imágenes de coarlumini localmente"
+log "Imágenes en containerd:"
+crictl images | grep coarlumini || log "⚠ No se encontraron imágenes de coarlumini localmente"
 
 log "✓ Proceso de descarga de imágenes completado"
 

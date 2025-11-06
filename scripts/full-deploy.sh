@@ -37,10 +37,27 @@ log "Zona: $ZONE"
 log "=========================================="
 
 # ============================================
-# PASO 1: VALIDACIÓN
+# PASO 0: PRE-VALIDACIÓN
 # ============================================
 
-log "Paso 1: Validando requisitos previos..."
+log "Paso 0: Ejecutando pre-validación del sistema..."
+
+if [ -f "./scripts/pre-deploy-validation.sh" ]; then
+    chmod +x ./scripts/pre-deploy-validation.sh
+    if ./scripts/pre-deploy-validation.sh; then
+        success "✓ Pre-validación completada exitosamente"
+    else
+        warning "⚠ Pre-validación encontró problemas, pero continuaremos..."
+    fi
+else
+    warning "⚠ Script de pre-validación no encontrado, continuando sin validación"
+fi
+
+# ============================================
+# PASO 1: VALIDACIÓN DE HERRAMIENTAS
+# ============================================
+
+log "Paso 1: Validando herramientas instaladas..."
 
 # Verificar gcloud
 if ! command -v gcloud &> /dev/null; then
@@ -73,35 +90,60 @@ fi
 success "✓ Validación completada"
 
 # ============================================
-# PASO 2: CONSTRUIR Y SUBIR IMÁGENES
+# PASO 2: VERIFICAR/CONSTRUIR IMÁGENES
 # ============================================
 
-log "Paso 2: Construyendo y subiendo imágenes Docker a GCR..."
+log "Paso 2: Verificando imágenes en GCR..."
 
-cd "$(dirname "$0")/.."
-./scripts/build-and-push.sh || error "Fallo en construcción de imágenes"
+# Verificar si las imágenes ya existen
+IMAGES_EXIST=true
+for image in database backend frontend; do
+    if ! gcloud container images describe "gcr.io/$PROJECT_ID/coarlumini-$image:latest" &>/dev/null; then
+        warning "⚠ Imagen no existe: coarlumini-$image:latest"
+        IMAGES_EXIST=false
+    fi
+done
 
-success "✓ Imágenes construidas y subidas"
+if [ "$IMAGES_EXIST" = false ]; then
+    log "Construyendo y subiendo imágenes Docker a GCR..."
+    cd "$(dirname "$0")/.."
+    ./scripts/build-and-push.sh || error "Fallo en construcción de imágenes"
+else
+    success "✓ Todas las imágenes ya existen en GCR"
+fi
+
+success "✓ Imágenes verificadas/construidas"
 
 # ============================================
-# PASO 3: ACTUALIZAR MANIFIESTOS
+# PASO 3: VALIDAR Y ACTUALIZAR MANIFIESTOS
 # ============================================
 
-log "Paso 3: Actualizando manifiestos de Kubernetes..."
+log "Paso 3: Validando y actualizando manifiestos de Kubernetes..."
 
-# Reemplazar ${PROJECT_ID} en los manifiestos
+# Ir al directorio de manifiestos
 cd ../coarlumini/k8s
 
+# Reemplazar ${PROJECT_ID} en los manifiestos
 for file in 04-database-deployment.yaml 06-backend-deployment.yaml 09-frontend-deployment.yaml; do
     if [ -f "$file" ]; then
         log "Actualizando $file..."
         sed -i "s|\${PROJECT_ID}|$PROJECT_ID|g" "$file"
+
+        # Corregir typo común en frontend
+        if [ "$file" = "09-frontend-deployment.yaml" ]; then
+            sed -i "s|coarlumini-frontend:latestst|coarlumini-frontend:latest|g" "$file"
+        fi
+
+        # Verificar que tenga imagePullSecrets
+        if ! grep -q "imagePullSecrets" "$file"; then
+            warning "⚠ $file no tiene imagePullSecrets (se agregará en el servidor)"
+        fi
     fi
 done
 
 cd ../../autoscaling-demo
 
-success "✓ Manifiestos actualizados"
+success "✓ Manifiestos validados y actualizados"
 
 # ============================================
 # PASO 4: VERIFICAR/CREAR REGLAS DE FIREWALL
@@ -226,8 +268,12 @@ gcloud compute ssh $K3S_SERVER_NAME --zone=$ZONE --command="
     sudo kubectl get pvc -n coarlumini
 
     echo ''
-    echo '=== IMÁGENES DOCKER EN MASTER ==='
-    sudo crictl images | grep coarlumini
+    echo '=== IMAGEPULLSECRET ==='
+    sudo kubectl get secret gcr-json-key -n coarlumini 2>/dev/null && echo 'ImagePullSecret: OK' || echo 'ImagePullSecret: NOT FOUND'
+
+    echo ''
+    echo '=== IMÁGENES EN CONTAINERD (K3S) ==='
+    sudo crictl images | grep coarlumini || echo 'No hay imágenes de coarlumini en containerd'
 "
 
 # ============================================
@@ -319,8 +365,20 @@ echo "💡 NOTAS IMPORTANTES:"
 echo ""
 echo "  • El cluster puede tardar 5-10 minutos en estar completamente operativo"
 echo "  • Los pods pueden tardar en estar 'Ready' mientras descargan imágenes"
+echo "  • K3s usa containerd (no Docker) para gestionar contenedores"
+echo "  • ImagePullSecret está configurado para acceder a GCR automáticamente"
 echo "  • El HPA (autoscaler) puede crear más pods según la carga"
 echo "  • Para destruir todo: $TF_CMD destroy -auto-approve"
+echo ""
+echo "🔧 TROUBLESHOOTING:"
+echo ""
+echo "  Si los pods tienen ImagePullBackOff:"
+echo "    gcloud compute ssh $K3S_SERVER_NAME --zone=$ZONE"
+echo "    sudo kubectl describe pod <pod-name> -n coarlumini"
+echo "    sudo kubectl get secret gcr-json-key -n coarlumini"
+echo ""
+echo "  Para verificar imágenes en containerd:"
+echo "    sudo crictl images | grep coarlumini"
 echo ""
 echo "=========================================="
 echo ""

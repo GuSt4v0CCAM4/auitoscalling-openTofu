@@ -232,6 +232,8 @@ sed -i "s|image: gcr.io/[^/]*/coarlumini-backend:latest|image: gcr.io/${PROJECT_
 # Actualizar imagen de frontend
 sed -i "s|image: gcr.io/cloudcomputingunsa/coarlumini-frontend:latest|image: gcr.io/${PROJECT_ID}/coarlumini-frontend:latest|g" 09-frontend-deployment.yaml 2>/dev/null || true
 sed -i "s|image: gcr.io/[^/]*/coarlumini-frontend:latest|image: gcr.io/${PROJECT_ID}/coarlumini-frontend:latest|g" 09-frontend-deployment.yaml 2>/dev/null || true
+# Corregir typo común latestst -> latest
+sed -i "s|coarlumini-frontend:latestst|coarlumini-frontend:latest|g" 09-frontend-deployment.yaml 2>/dev/null || true
 sed -i "s|coarlumini-frontend:late|coarlumini-frontend:latest|g" 09-frontend-deployment.yaml 2>/dev/null || true
 
 # Cambiar storageClassName a local-path para K3s (ya debería estar en archivos base, pero por si acaso)
@@ -246,6 +248,12 @@ for file in 04-database-deployment.yaml 06-backend-deployment.yaml 09-frontend-d
         sed -i '/imagePullPolicy:/d' "$file"
         # Agregar IfNotPresent después de cada línea de image
         sed -i '/image: gcr.io/a\          imagePullPolicy: IfNotPresent' "$file"
+
+        # Agregar imagePullSecrets si no existe
+        if ! grep -q "imagePullSecrets" "$file"; then
+            log "Agregando imagePullSecrets a $file..."
+            sed -i '/^    spec:$/a\      imagePullSecrets:\n      - name: gcr-json-key' "$file"
+        fi
     fi
 done
 
@@ -255,26 +263,61 @@ log "✓ Manifiestos actualizados"
 # DESCARGAR IMÁGENES DOCKER DESDE GCR
 # ============================================
 
-log "Descargando imágenes Docker desde GCR..."
+log "Configurando autenticación con GCR para containerd..."
 
-# Autenticar Docker con GCR usando el service account
-gcloud auth configure-docker gcr.io --quiet 2>/dev/null || log "⚠ No se pudo configurar docker auth"
+# K3s usa containerd, no Docker, así que usamos crictl
+# Primero, configurar gcloud auth
+gcloud auth configure-docker gcr.io --quiet 2>/dev/null || log "⚠ No se pudo configurar gcloud auth"
 
-# Descargar las tres imágenes
+# Crear ImagePullSecret para Kubernetes
+log "Creando ImagePullSecret para GCR..."
+
+# Crear clave del service account
+SA_EMAIL="k3s-cluster-sa@${PROJECT_ID}.iam.gserviceaccount.com"
+KEY_FILE="/tmp/gcr-key-${PROJECT_ID}.json"
+
+# Verificar si ya existe una clave, si no, crear una
+if [ ! -f "$KEY_FILE" ]; then
+    log "Creando clave de service account..."
+    gcloud iam service-accounts keys create "$KEY_FILE" \
+        --iam-account="$SA_EMAIL" \
+        --project="$PROJECT_ID" 2>/dev/null || log "⚠ No se pudo crear clave de SA"
+fi
+
+# Crear ImagePullSecret en Kubernetes
+if [ -f "$KEY_FILE" ]; then
+    kubectl create secret docker-registry gcr-json-key \
+        --docker-server=gcr.io \
+        --docker-username=_json_key \
+        --docker-password="$(cat $KEY_FILE)" \
+        --docker-email="$SA_EMAIL" \
+        -n coarlumini 2>/dev/null || log "Secret ya existe o no se pudo crear"
+
+    log "✓ ImagePullSecret creado"
+
+    # Limpiar clave temporal
+    rm -f "$KEY_FILE"
+else
+    log "⚠ No se pudo crear ImagePullSecret"
+fi
+
+# Descargar imágenes usando crictl (containerd)
+log "Descargando imágenes con crictl (containerd)..."
+
 log "Descargando imagen de database..."
-docker pull gcr.io/${PROJECT_ID}/coarlumini-database:latest 2>/dev/null || log "⚠ No se pudo descargar imagen de database"
+crictl pull gcr.io/${PROJECT_ID}/coarlumini-database:latest 2>/dev/null || log "⚠ No se pudo descargar imagen de database"
 
 log "Descargando imagen de backend..."
-docker pull gcr.io/${PROJECT_ID}/coarlumini-backend:latest 2>/dev/null || log "⚠ No se pudo descargar imagen de backend"
+crictl pull gcr.io/${PROJECT_ID}/coarlumini-backend:latest 2>/dev/null || log "⚠ No se pudo descargar imagen de backend"
 
 log "Descargando imagen de frontend..."
-docker pull gcr.io/${PROJECT_ID}/coarlumini-frontend:latest 2>/dev/null || log "⚠ No se pudo descargar imagen de frontend"
+crictl pull gcr.io/${PROJECT_ID}/coarlumini-frontend:latest 2>/dev/null || log "⚠ No se pudo descargar imagen de frontend"
 
 # Verificar imágenes descargadas
-log "Imágenes Docker locales:"
-docker images | grep coarlumini || log "⚠ No se encontraron imágenes de coarlumini"
+log "Imágenes en containerd:"
+crictl images | grep coarlumini || log "⚠ No se encontraron imágenes de coarlumini"
 
-log "✓ Imágenes Docker descargadas"
+log "✓ Imágenes descargadas con crictl"
 
 # ============================================
 # CREAR SCRIPT DE DEPLOYMENT
@@ -296,7 +339,10 @@ log "Aplicando namespace y configuraciones..."
 kubectl apply -f 00-namespace.yaml 2>/dev/null || true
 kubectl apply -f 01-configmap.yaml 2>/dev/null || true
 kubectl apply -f 02-secrets.yaml 2>/dev/null || true
-kubectl apply -f 11-nginx-config.yaml 2>/dev/null || true
+
+# IMPORTANTE: Aplicar nginx-config ANTES del frontend
+log "Aplicando nginx-config..."
+kubectl apply -f 11-nginx-config.yaml 2>/dev/null || log "⚠ No se encontró nginx-config.yaml"
 
 # Aplicar PVCs
 log "Creando volúmenes persistentes..."
